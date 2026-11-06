@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.kv
+*.kv.lock
+*.compacting
+*.lock
+torture-work/
+.venv/
+venv/

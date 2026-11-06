@@ -1,0 +1,709 @@
+KILL IT AND PROVE IT
+Phase 0 study guide for a beginner team
+Architecture proposal, requirements, and judge-defense notes
+Status: proposal only. No database code has been written. Nothing here is proven yet.
+
+How to use this guide
+Read it in order. Do not skip Section 4 of the official problem (the invariant). That one rule decides the score.
+This document teaches the design we propose. It is not the final ARCHITECTURE.md. The final file must describe the code we actually write, after tests exist.
+When a judge asks a question, answer from the disk state and the next open(), not from hope.
+
+PART 1. WHAT THIS HACKATHON REALLY IS
+
+1.1 The one-line challenge
+Build a key-value database from scratch that survives being killed at any moment, and prove that to a judge in 15 minutes.
+
+A key-value database is a filing cabinet. A key is the label on a folder. A value is the paper inside. put stores a paper. get reads it. delete throws the folder away. batch is a stack of changes that must all happen together.
+
+1.2 What a crash means here
+The process is killed with no cleanup. On Windows that is TerminateProcess, which is what Task Manager End Task and Python subprocess kill use. The kill can land in the middle of a write, an fsync, a rename, or recovery.
+
+The operating system and the disk are assumed to be honest. Once fsync returns, those bytes are on disk. We are not required to survive the laptop losing power. If our design also survives power loss, we may say so only after we can explain why. We will not claim power-loss safety just because we call fsync.
+
+1.3 What winning means
+The score is 100 points.
+30 points: the judge's kills find zero broken promises.
+15 points: the torture tool is honest and dangerous.
+10 points: the architecture diagram and the 32-row proof table match the code.
+20 points: three crash-here questions, answered precisely without running the code.
+15 points: BREAKING.md is accurate and honest.
+10 points: the design-extension question about key expiry.
+Penalties: recovery slower than 2 seconds at 1,000,000 keys is minus 5. A file that never shrinks is minus 5. Disk-full that corrupts data is minus 10. A missing PROMPTS.md is minus 10.
+A rigged torture tool, a banned library, copied database code, code written before the event, or AI during the demo is disqualification.
+
+A database that works only when nothing dies is worth zero of the 30 survival points.
+
+1.4 What we must be able to say out loud
+Every team member must explain recovery. The judge may point at one person. "I think it is fine" scores zero. A good answer names what bytes are on disk and what the next open() does with them.
+
+
+PART 2. OFFICIAL REQUIREMENTS, CHECKED AGAINST THE PDF
+
+The original problem statement is the authority. Your extra instructions were checked against it. Where they agree, we follow them. Where they are stricter than the PDF, we keep the stricter rule when it is safe. Where they invent a rule the PDF does not have, we do not treat it as law.
+
+2.1 Verified functional requirements
+put(key, value) stores the value and overwrites an existing key. After put returns success, the value survives a crash.
+get(key) returns the current value, or not-found. The CLI must print NOTFOUND.
+delete(key) removes the key. Deleting a missing key is not an error. After delete returns success, the key stays gone.
+batch(ops) applies a list of puts and deletes atomically. After a crash the batch is fully present or fully absent.
+open(path) creates or opens the one data file and recovers. With 1,000,000 keys it must finish in under 2 seconds.
+close() flushes and closes cleanly. close is a library operation. It is not one of the eight CLI commands.
+Exactly one authoritative data file. A lock file and a temporary compaction file are allowed.
+The file must be able to shrink. After 1,000,000 puts and then 1,000,000 deletes, compaction must make the file able to shrink, and compaction must be crash-safe.
+open(path, max_bytes=N) is required. A write that would pass the cap fails with a clear error. Existing data stays readable and recoverable.
+At least two threads, or two processes, can put, delete, and batch at the same time without corrupting the file or breaking atomicity.
+get may run during writes. A get sees the state before a batch or after it, never half of it.
+A single global lock is explicitly allowed. Fancy concurrency earns no extra points.
+
+2.2 Verified limits
+Keys: byte strings, length 1 to 1,024 bytes.
+Values: byte strings, length 0 to 1 MB. Empty values are valid.
+At least 1,000,000 keys in one database.
+A batch may contain up to 10,000 operations.
+Recovery under 2 seconds at 1,000,000 keys, on the judge's run, on your laptop.
+Torture default: 500 kill/restart iterations.
+Demo torture run: 200 iterations with the judge's seed, then compaction and recovery-crash modes.
+
+2.3 Verified commands
+From the repository root, these eight commands must work. The README may replace ./kvdb with python src/cli.py. The judge follows the README.
+open PATH [--max-bytes N] opens or creates, runs recovery, prints key count and recovery time.
+put PATH KEY VALUE
+get PATH KEY prints the value, or NOTFOUND.
+del PATH KEY
+batch PATH FILE with one operation per line: put k v, or del k.
+dump PATH prints every key and value, sorted by key.
+check PATH prints OK or a reason.
+serve PATH is the long-running mode. It reads operations from stdin and prints ACK op-id only after the operation is durable.
+
+2.4 Verified non-functional rules
+Any language is allowed. You asked for Python 3. Python is allowed. We will use Python.
+The standard library is allowed, including files, threads, hashing, and os.fsync.
+A test framework such as pytest is allowed by the PDF. We will use Python unittest, which is already in the standard library, so a clean laptop does not need pip.
+SQLite, LevelDB, RocksDB, LMDB, Berkeley DB, Redis, and any library that stores keys for us are banned.
+Any library that implements write-ahead logging, journaling, B-trees, or LSM trees for us is banned.
+Copying source from an existing database is banned. Reading it is allowed.
+Code written before the hackathon starts is banned. Commits must happen after the start, in a fresh repository.
+The system must run with Wi-Fi off.
+Git history must show real work across the event. One giant commit at hour 23 is a red flag.
+README build instructions must work on a clean machine with only the language toolchain.
+
+2.5 The invariant, in plain words
+After a crash, and after open() finishes recovery:
+1. Every operation that returned success is present.
+2. Every operation that had not returned success is either fully present or fully absent.
+3. A batch counts as one operation. It is never partly present.
+4. No key holds a value that was never written. No torn value. No value from another key.
+5. open() never fails on a file this database itself produced, no matter when it was killed.
+
+Operations still in flight may vanish. That is correct. Losing an acknowledged operation is the failure that loses points.
+
+2.6 All 32 scenarios the proof table must cover
+Group A, crash during one write:
+A1 Kill before any bytes of a put reach the file. Key absent, or previous value.
+A2 Torn write. Torn bytes are ignored, never returned as a value.
+A3 Record fully written, fsync not finished. Either outcome is acceptable. Nothing else is corrupted.
+A4 fsync returned, put had not returned to the caller. Key must be present. The promise was durable even though the caller never heard it.
+A5 Kill immediately after put returns success. Key present.
+A6 Kill during delete. Key still has the old value, or the key is absent. Never a corrupted value.
+A7 A 1 MB value. Same rules as A1 to A5.
+
+Group B, crash during a batch:
+B1 Kill after 3 of 10 operations are written. None of the 10 are visible.
+B2 All 10 written, commit marker not written. None visible.
+B3 Commit marker written, fsync not done. All or none. Never some.
+B4 Batch returned success. All 10 visible.
+B5 A batch that puts key X and deletes key X. We must define the order and honour it. Proposal: operations apply in listed order. The last one wins. put then delete leaves X absent. delete then put leaves X present with the new value.
+B6 10,000 operations, killed halfway. None visible. The next recovery still finishes in under 2 seconds.
+
+Group C, crash during recovery and maintenance:
+C1 Kill while replaying the log. The next open succeeds and reaches the same state.
+C2 Kill while truncating a torn tail. The next open succeeds.
+C3 Kill during compaction before the new file replaces the old. The old file remains authoritative.
+C4 Kill during the replace. Exactly one of old or new is authoritative. Both are complete. Nothing is lost.
+C5 Kill after the swap, before temp cleanup. Data intact. Leftover temp files are ignored or deleted on the next open.
+C6 Kill during close. Same rules as any other kill.
+
+Group D, concurrency:
+D1 Two writers, different keys. Every acknowledged put is present.
+D2 Two writers, same key. The value is one complete value that one writer actually wrote.
+D3 A long batch plus single puts. The batch is all or nothing. Acknowledged single puts are present.
+D4 A reader during a batch, no crash. The reader sees before or after, never the middle.
+
+Group E, disk full, simulated by max_bytes:
+E1 Cap hit during one put. Error. Previous data intact and readable.
+E2 Cap hit halfway through a batch. Error. None of that batch is visible.
+E3 Cap hit, then killed. Restart works. Acknowledged data intact.
+E4 Cap hit during compaction. Compaction fails or finishes. No data lost. The file still opens.
+E5 After deletes free logical space and compaction runs, writes succeed again.
+
+Group F, repeated abuse:
+F1 500 random kills and restarts. The invariant holds after every one.
+F2 Kill during recovery, more than once. Recovery is idempotent. Doing it twice reaches the same state.
+F3 1,000,000 keys, kill, open. Under 2 seconds. Acknowledged keys present.
+F4 Someone chops 1 byte off the end of the file. open succeeds. At most the last unacknowledged record is lost.
+
+Not required, so we will not spend the night on them:
+Random bit rot in the middle of the file. We will mention detection in the document.
+Networking, sharding, multi-batch transactions, isolation levels, MVCC.
+Making writes fast. Slow writes are allowed. Lost writes are not.
+
+
+PART 3. CONFLICTS AND AMBIGUITIES
+
+3.1 Conflicts we resolved by following the PDF
+The extra prompt says "do not code until we approve". We are obeying that.
+The extra prompt says Python only. The PDF allows any language. Python is a legal choice. We keep Python because you asked for it.
+The extra prompt says no external libraries at all. The PDF allows pytest and serialisation libraries such as msgpack. We will stay inside the Python standard library so the demo cannot fail because a package is missing. That is stricter than the PDF and still legal.
+The extra prompt lists commands and limits that match the PDF. They are confirmed.
+
+3.2 Things the PDF does not specify, and the choice we propose
+We will not invent these silently. Please approve them.
+
+Choice 1. Batch order. Listed order, last write wins. See B5.
+
+Choice 2. CLI text is UTF-8. Keys and values in the CLI are UTF-8 byte strings. A value may contain spaces: in batch files and in put, the key is the first token and the value is the rest of the line. Keys in the text CLI cannot contain spaces or newlines. Empty values are allowed and are written as an empty remainder. If a judge needs raw bytes, dump and get will use one documented escaping rule so a value can contain newlines without looking like two records: backslash escapes for backslash, newline, tab, and non-text bytes as \xHH. The torture tool and the CLI will share that rule.
+
+Choice 3. serve protocol, because the PDF says ACK op-id but does not define the input lines. Proposed human-typeable protocol:
+put OPID KEY VALUE
+del OPID KEY
+batch OPID COUNT
+then COUNT lines of "put KEY VALUE" or "del KEY"
+Replies:
+ACK OPID
+ERR OPID message
+On startup, after recovery:
+READY key_count recovery_ms
+The judge can type a batch by hand. ACK is printed only after fsync of the commit marker returns.
+
+Choice 4. One process, one global lock. The library uses one threading.Lock around get, put, delete, batch, compaction, and recovery. Two threads can call the library at the same time. The lock makes their critical sections happen one at a time, so a get cannot see half a batch. A lock file beside the data file stops two processes from writing the same database at once. The PDF allows a lock file. The torture tool still uses one serve process and at least two writer threads in the tool, which matches the PDF.
+
+Choice 5. max_bytes counts the authoritative data file only. The temporary compaction file may exist beside it. If the cap would be crossed, we refuse the write before appending it. If a batch does not fit, we write none of it.
+
+Choice 6. check prints OK or a reason and returns a failing exit code when the file is not OK. It does not repair. open repairs a torn tail by truncating to the last valid commit. That split is easy to explain: check inspects, open recovers.
+
+Choice 7. Project folder name, proposed: C:\Users\User\Projects\kill-it-kvdb or, if you prefer, a folder you name. We will create it only after you approve, and we will commit only if you say the hackathon clock has started. Code committed before the official start can disqualify the team.
+
+
+PART 4. CONCEPTS, TAUGHT SLOWLY
+
+For each idea: meaning, real life, why we need it, where it lives, what breaks if we remove it, and a judge question.
+
+4.1 Durability
+Meaning: after we say success, the data is still there after the process is killed.
+Real life: a bank teller who says "deposited" only after the cash is inside the vault, not when it is still in their hand.
+Why: the 30-point score is this promise.
+Where: put, delete, batch, and ACK in serve, and only after os.fsync returns.
+If we remove it: we return success while bytes sit in memory. A kill loses acknowledged data.
+Example: put key hello, fsync returns, then the power of the process is cut before the function returns. After restart, hello is present. That is scenario A4.
+Judge question: When do you print ACK?
+Ideal answer: After the commit record is written and os.fsync on that file returns. Not when the bytes are only in Python's buffer, and not when they are only in the operating-system cache.
+
+4.2 Atomicity
+Meaning: a batch is one promise. All of it is visible, or none of it is.
+Real life: a recipe card. You do not want the cake's eggs recorded and the flour missing if the kitchen catches fire halfway through the card.
+Why: scenario B1 and D4.
+Where: every batch shares one transaction id. A commit marker after the records makes the whole transaction real. Recovery applies a transaction only when its commit marker is valid.
+If we remove it: a kill after 3 of 10 records makes those 3 visible. That fails B1.
+Judge question: Why is a batch not 10 separate puts?
+Ideal answer: Each separate put would fsync and become durable on its own. A kill in the middle would leave a partial batch. We write all records first, fsync, then write one commit marker, then fsync. No marker means the records are ignored.
+
+4.3 Recoverability
+Meaning: open() can always finish on a file we created, even if the last open() or the last compaction was killed.
+Real life: a notebook with a torn last page. You throw away the torn page and keep every finished page. You can do that even if you were killed while throwing the torn page away, because the finished pages were already safe.
+Why: scenario C1, C2, F2, and invariant rule 5.
+Where: open() scans, stops at the first bad frame, truncates the tail, rebuilds the memory index from committed transactions only.
+If we remove it: a half-written tail makes the next open crash, and the judge cannot dump the database.
+Judge question: What if we crash during recovery?
+Ideal answer: Recovery only deletes a tail that was not committed, or it only replaces the file after the new file is complete and fsynced. Running it again sees the same committed prefix and reaches the same index.
+
+4.4 fsync
+Meaning: os.fsync(fd) asks the operating system to push the file's bytes to the disk and to wait until that is done.
+Real life: telling a clerk "do not just hold my letter, put it in the safe and come back when the door is shut."
+Why: without fsync, a kill might still keep data, because the operating system cache survives the process. That hides bugs. The FAQ says the judge may ask us to prove where we call fsync.
+Where: after the record payload, and again after the commit marker. Also after a truncation, and on the temporary file before we replace the real file.
+If we remove it: ACK can be a lie. Also our tests can pass for the wrong reason.
+Judge question: Does fsync protect us from unplugging the laptop?
+Ideal answer: The problem says that once fsync returns, bytes are on disk, and they are not testing lying hardware. We rely on that for process kill. We do not claim we simulated a power cut.
+
+4.5 Torn write
+Meaning: the kill lands in the middle of a write, so the file ends with a partial record.
+Real life: a sentence cut off by a slammed door: "the value is hel".
+Why: scenario A2 and F4.
+Where: every record has a length and a checksum. If the tail is short or the checksum does not match, recovery ignores it and truncates there.
+If we remove it: the next get might return "hel" as if it were a real value.
+Judge question: The process dies in the middle of write(). What does get return?
+Ideal answer: Not the torn bytes. The record has no valid checksum, so it is not committed. get returns the previous value, or NOTFOUND if there was none.
+
+4.6 Checksum
+Meaning: a CRC32 number computed from the bytes. On read we compute it again. If it differs, the bytes changed or were cut.
+Real life: a total written at the bottom of a receipt. If the total does not match the lines, you do not trust the receipt.
+Why: a torn tail and a mixed-up value must not look valid.
+Where: zlib.crc32, which is in the Python standard library. It covers the record header and the key and value bytes.
+If we remove it: a partial record whose length field happens to look short could be accepted.
+Judge question: Why CRC32 and not a cryptographic hash?
+Ideal answer: We are detecting torn writes, not attackers. CRC32 is fast, in the standard library, and enough for this problem. Bit rot in the middle of the file is not a required test. A checksum still catches many of those cases, and we will say that honestly.
+
+4.7 Commit marker
+Meaning: a small record that says "transaction N is finished."
+Real life: a wax seal on an envelope. The letter pages do not count until the seal is there and intact.
+Why: this is how B1, B2, and B3 become easy to explain.
+Where: a COM1 frame after the data frames of that transaction, followed by its own fsync.
+If we remove it: the only way to be atomic is to fsync every operation separately and somehow undo them, which is harder and slower.
+Judge question: The records are on disk and the marker is not. What is visible?
+Ideal answer: Nothing from that transaction. Recovery applies a transaction only when the commit marker is complete and its checksum matches. That is scenario B2.
+
+4.8 The in-memory index
+Meaning: a Python dictionary from key to value, built in RAM at open and updated only after a commit is durable.
+Real life: the contents page of a book. The book on the shelf is the truth. The contents page is a fast way to find a chapter. If the contents page burns, you rebuild it by reading the book.
+Why: get must be correct, and recovery of a million keys must be fast enough. We do not persist the dictionary as a second source of truth.
+Where: one dict inside the Database object. It is updated only after the commit fsync, while the global lock is still held.
+If we remove it: every get scans the whole file. That can be correct but makes the demo painful. If we update it before fsync, a get can see a batch that we later roll back. That breaks D4 and E2.
+Judge question: Where does the index live on disk?
+Ideal answer: It does not. The file is the truth. The dictionary is rebuilt from committed records during open. A crash cannot leave the dictionary half-updated because the dictionary dies with the process.
+
+4.9 The global lock
+Meaning: a bathroom-key rule. Only one thread at a time may run a database operation.
+Real life: one pen for a shared notebook. Two people cannot write a sentence at the same time and splice their words.
+Why: D2 says two writers of the same key must never create a mixed value. D4 says a reader must not see half a batch.
+Where: one threading.Lock acquired at the start of get, put, delete, batch, check, and compaction.
+If we remove it: two threads can append to the file at the same time and interleave bytes. The file becomes garbage.
+Judge question: You used one lock. Is that too slow?
+Ideal answer: The problem says a single global lock is allowed and fancy concurrency earns no points. Correctness is the score.
+
+4.10 Compaction
+Meaning: rewrite the file so it contains only the latest value of each live key, dropping overwritten values and deleted keys.
+Real life: recopying a notebook into a fresh notebook, skipping crossed-out lines, then swapping the notebooks only when the new one is finished.
+Why: the file must not grow forever. After a million deletes, the file must be able to shrink. Compaction must survive a kill.
+Where: a temporary file, fsync, then os.replace onto the real path. open() deletes leftover temp files only after the real file is valid.
+If we remove it: the file only grows, and we lose 5 points. If we replace the file before the temp file is fsynced, C4 can lose every key.
+Judge question: Why is the old file still safe if we die before the replace?
+Ideal answer: We never write the snapshot into the live file in place. The live file is untouched until os.replace. A kill before that leaves the old file as the only authoritative file. That is C3.
+
+4.11 Disk-full behaviour
+Meaning: we pretend the disk is full by refusing to grow past max_bytes.
+Real life: a suitcase with a weight limit. If the next item does not fit, you do not tear the previous items out. You refuse the new item.
+Why: group E is worth a 10-point penalty if we corrupt data.
+Where: before a write, we compute the new size. If it would pass max_bytes, we return an error and leave the file pointer where it was.
+If we remove it: the file grows without a limit, and a mid-batch failure can leave a partial commit if we are careless.
+Judge question: The cap is hit on operation 500 of a 10,000-op batch. What does get show?
+Ideal answer: None of that batch. We check the whole batch size first. If it does not fit, we append nothing and we do not write a commit marker.
+
+4.12 The oracle
+Meaning: a log owned by the torture tool, not by the database, listing every operation that received ACK.
+Real life: a referee's notebook. The player does not get to mark their own score.
+Why: the PDF says a tool that trusts the database's own dump is a weak tool and can be treated as rigged.
+Where: torture/oracle log, written when the tool reads ACK from stdout, before the next kill.
+If we remove it: we cannot prove acknowledged writes survived.
+Judge question: How do you know a key should exist?
+Ideal answer: Because the tool saw ACK for that op-id and stored the op in its own log before it killed the process. After restart, dump must reflect every such op, and no value the oracle never wrote.
+
+4.13 Process kill versus power loss
+Meaning: process kill destroys the program's memory and stops it mid-instruction. The operating-system disk cache can still hold bytes. fsync pushes those bytes out. Power loss also wipes the cache and can interrupt the disk itself.
+Real life: firing the clerk (process kill) versus the building burning down (power loss).
+Why: the PDF says process death is the test. Confusing the two makes us claim a test we did not run.
+Where: torture uses process.kill(), which on Windows is TerminateProcess. We will write that sentence in BREAKING.md.
+If we pretend they are the same: a judge can ask "did you pull the plug?" and we would have to say no.
+
+4.14 Idempotent recovery
+Meaning: running recovery twice is the same as running it once.
+Real life: throwing away a torn page. Doing it again does not throw away a good page.
+Why: scenario F2 kills open() itself.
+Where: recovery's only destructive act on the live file is truncating a torn uncommitted tail, or ignoring a temp file. After the first success, the tail is already clean, so the second open only rebuilds the same dictionary.
+
+
+PART 5. DESIGN ALTERNATIVES, AND WHY WE PICK ONE
+
+5.1 Rewrite the whole file on every put
+Simple and atomic, like saving a new copy of a document. At 1,000,000 keys this is far too much copying, and a 1 MB value makes every small put rewrite a huge file. We reject it.
+
+5.2 A B-tree we write ourselves
+The PDF allows it. A torn page in the middle of a B-tree is hard for beginners to repair in 24 hours. Complexity earns no points. We reject it for this event.
+
+5.3 An LSM tree with many files
+Real databases do this. The PDF demands one authoritative file and crash-safe compaction. Multiple levels add swap bugs. We reject it.
+
+5.4 SQLite or any storage library
+Banned. Using it disqualifies the team.
+
+5.5 Chosen design: one append-only commit log, one in-memory dictionary, crash-safe compaction
+We append records to the end of one file. A transaction becomes visible only after its commit marker is fsynced. On open we rebuild the dictionary from committed data. When the file has too much garbage, we write a fresh snapshot to a temp file and atomically replace the old file.
+This matches every group A to F story with one mechanism a beginner can draw.
+The risk we already know: Python might be slow to rebuild 1,000,000 keys. We will measure that before hour 14. If a full replay is over 2 seconds, compaction's snapshot format stays the same but we keep the live file compacted so recovery reads each live key once, not the whole history. The PDF says a careful replay of 1,000,000 records is usually fast enough. We will not claim the number until we time it.
+
+
+PART 6. ARCHITECTURE
+
+6.1 Components
+cli.py: turns the eight commands into library calls. It does not contain recovery rules.
+kvdb.py: the database. It owns the file, the lock, the index, the writer, the recovery routine, the compaction routine, and the max_bytes guard.
+format helpers inside kvdb.py: pack and unpack frames, compute CRC32. Kept in one file so the judge can see the whole story without a maze of modules. If the file becomes hard to read, we may split format.py later and say why.
+torture/torture.py: the independent breaker. It speaks only the serve protocol. It does not import the engine's private functions to "help" a check pass.
+tests/: small unittest checks for format, atomicity, and errors. The torture tool is the real proof.
+
+6.2 Diagram in words
+You can redraw this by hand. A box diagram with only "Database" and "File" scores zero. Ours has a path.
+
+Clients
+  CLI commands and the torture tool
+        |
+        v
+  serve stdin/stdout or direct library calls
+        |
+        v
+  Global lock  ---- protects everything below
+        |
+        +--> In-memory dictionary (key to value)
+        |
+        +--> Writer
+        |      1. check max_bytes
+        |      2. append PUT/DEL frames
+        |      3. fsync
+        |      4. append COM1 commit marker
+        |      5. fsync
+        |      6. only then update the dictionary
+        |      7. only then return success / ACK
+        |
+        +--> Recovery, on open
+        |      validate header
+        |      scan frames
+        |      stop at torn tail
+        |      apply only committed transactions
+        |      truncate torn tail
+        |      ignore or delete leftover temp file
+        |
+        +--> Compaction
+               write temp snapshot
+               fsync temp
+               os.replace temp onto the real file
+               reopen the new file
+        |
+        v
+  One data file: header + frames
+  Beside it, allowed extras:
+    path.lock  the lock file
+    path.compacting  the temp snapshot, never authoritative
+
+6.3 Folder we will create after approval
+team folder/
+  README.md
+  ARCHITECTURE.md
+  BREAKING.md
+  PROMPTS.md
+  diagrams/
+  src/kvdb.py
+  src/cli.py
+  tests/
+  torture/torture.py
+  .gitignore
+  .git/
+
+6.4 On-disk format, byte by byte
+All integers are unsigned and little-endian. Little-endian means the least significant byte is stored first. Python struct format "<" does that. We pick one order and document it so a judge can parse a hex dump.
+
+Header, exactly 64 bytes:
+Offset 0, 4 bytes: magic ASCII KVDB
+Offset 4, 4 bytes: version, integer 1
+Offset 8, 4 bytes: flags, integer 0 for now
+Offset 12, 4 bytes: header length, integer 64
+Offset 16, 8 bytes: generation. Starts at 1. Compaction adds 1.
+Offset 24, 8 bytes: max_bytes. 0 means no cap.
+Offset 32, 8 bytes: committed_offset hint. This is a hint only. Recovery does not trust it if it points past a valid scan. It exists so we can explain a fast path later. The scan is the authority.
+Offset 40, 20 bytes: reserved, zeros
+Offset 60, 4 bytes: CRC32 of the first 60 bytes
+
+If the header checksum fails, open() raises an error. We do not try to guess a destroyed header. The tests do not require us to repair bit rot. A header we half-wrote at creation is avoided by writing the header, fsyncing it, and only then accepting the database as created. A crash during the very first creation can leave an incomplete file. open() will refuse it and the caller can delete it. We will state that creation crash clearly. Once the header fsync has returned, later crashes must not make open fail.
+
+After the header, frames are packed back to back.
+
+Every frame begins with:
+4 bytes magic
+4 bytes frame_length, counting all bytes of the frame including magic and the final CRC
+2 bytes frame kind
+2 bytes flags, zero
+8 bytes transaction id
+4 bytes payload length
+then payload
+then 4 bytes CRC32 of every byte in the frame except the CRC itself
+
+frame_length lets us know how many bytes to read. If the file ends before that many bytes, the frame is torn. We stop and truncate at the frame start.
+
+Kinds:
+1 = PUT
+2 = DEL
+3 = COMMIT
+4 = SNAPSHOT_START
+5 = SNAPSHOT_END
+
+PUT payload:
+4 bytes key length
+4 bytes value length
+key bytes
+value bytes
+key length must be 1 to 1024. value length must be 0 to 1,048,576.
+
+DEL payload:
+4 bytes key length
+key bytes
+
+COMMIT payload:
+4 bytes operation count
+The operation count must equal the number of PUT and DEL frames in this transaction since the previous commit. If it does not, the commit is invalid and the transaction is discarded.
+
+SNAPSHOT_START payload:
+8 bytes live-key count
+This starts a compacted image. The next live-key count frames are PUT frames of live keys, already the latest values. They share one snapshot transaction id.
+
+SNAPSHOT_END payload:
+8 bytes live-key count
+8 bytes generation
+This is the commit marker of a snapshot. Recovery accepts the snapshot only if SNAPSHOT_END is valid and the count matches.
+
+CRC32 is zlib.crc32 masked to 32 bits.
+
+A transaction is either:
+one or more PUT or DEL frames with the same transaction id, followed by one COMMIT
+or a snapshot: SNAPSHOT_START, PUT frames, SNAPSHOT_END
+
+Records written after the last valid COMMIT or SNAPSHOT_END are ignored.
+
+6.5 Write ordering for one put
+Call the key K and the value V.
+1. Take the global lock.
+2. If the database is closed, fail.
+3. Compute the frame sizes: one PUT frame plus one COMMIT frame.
+4. If max_bytes is set and current file size plus those bytes would exceed it, release nothing on disk, return a clear error, keep the lock until the function exits so a concurrent writer sees a stable size.
+5. Remember the file offset. Call it checkpoint.
+6. Append the PUT frame bytes.
+7. Flush the Python buffer and os.fsync.
+8. Append the COMMIT frame bytes.
+9. Flush and os.fsync.
+10. Update the dictionary: index[K] = V.
+11. Release the lock and return success.
+If anything fails after step 6 and before step 10, seek back to checkpoint, truncate, fsync the truncation, and return an error. If the process dies before step 10, recovery's scan does the same logical thing: no valid commit, so K is unchanged.
+
+A delete is the same with a DEL frame. If the key is already absent, we still append a DEL and commit it, so the success is a real durable no-op. Replaying a delete of a missing key does nothing. That keeps "delete of a missing key is not an error" and "success stays success" obvious.
+
+6.6 Write ordering for a batch
+1. Take the lock.
+2. Validate every operation before writing. Bad key length fails the whole batch with no bytes written.
+3. Compute the total byte size of all frames plus one COMMIT.
+4. If that total does not fit in max_bytes, return an error with nothing written.
+5. Remember checkpoint.
+6. Append every PUT or DEL frame, same transaction id, no commit yet.
+7. fsync.
+8. Append COMMIT with the operation count.
+9. fsync.
+10. Apply the whole batch to the dictionary in order.
+11. Return success.
+A failure in steps 6 to 9 truncates back to checkpoint. A kill before step 9's fsync means the commit is either fully durable or not. If the commit frame is torn, recovery discards the transaction. If the commit frame is fully durable, recovery applies all of it. There is no path that applies 3 of 10, because the dictionary and the recovery scan both wait for the commit.
+
+6.7 Why this order matches A3, A4, B2, and B3
+A3: payload fsync has not finished, or commit is not written. Success was not returned. Either the commit later landed or it did not. Both are allowed.
+A4: commit fsync returned, so the marker is on disk, then the kill happens before return. Recovery sees the marker. The key is present.
+B2: no marker. Nothing visible.
+B3: marker written, its fsync not finished. If the marker's bytes are fully on disk and the checksum matches, all are visible. If not, none are. Never some, because we never apply a transaction frame by frame without the marker.
+
+6.8 Recovery algorithm
+1. Open the file read/write.
+2. If the file is empty, this is a bug or a crashed create. Fail with a clear error rather than pretending it is a healthy empty database. A healthy empty database is a valid 64-byte header and nothing else, created by open() before it returns.
+3. Read 64 bytes. Check magic, version, and header CRC. On failure, raise. Do not continue.
+4. Look beside the file for a temp compaction file. Do not let it replace the real file. Delete it only after the real header is valid, or leave it and overwrite it on the next compaction. Preferred: delete the leftover temp after the real file is validated, and say so in the proof row C5.
+5. Set a cursor to byte 64. Set an empty dictionary. Remember last_good = 64.
+6. While enough bytes remain for a frame header:
+   Read the fixed prefix. If not enough bytes, stop.
+   Read frame_length. If frame_length is smaller than the minimum frame or larger than the remaining sane maximum, stop.
+   If not enough bytes remain for the whole frame, stop.
+   Read the frame. Recompute CRC32. If it mismatches, stop.
+   If the kind is unknown, stop.
+   If the kind is PUT or DEL, hold it in a pending list under its transaction id. Do not touch the dictionary.
+   If the kind is COMMIT, check the pending frames for that id and the count. If they match, apply them to the dictionary in order and set last_good to the end of this frame. Clear that pending list.
+   If the kind is SNAPSHOT_START, begin a pending snapshot.
+   If the kind is SNAPSHOT_END and the snapshot is complete and the count matches, replace the dictionary with the snapshot contents and set last_good to the end of this frame. A snapshot is a full picture, not a patch, so it replaces the dictionary rather than merging. After a compaction file, the snapshot is at the start and there is no older data.
+7. When we stop, if the file is longer than last_good, truncate to last_good and fsync. That drops the torn tail.
+8. Record recovery time and key count.
+9. Recovery holds the global lock. A kill in the middle leaves either the old length or the truncated length. Both still start with the same committed prefix, so the next open rebuilds the same dictionary.
+
+Pending frames that never receive a commit are dropped. They do not update last_good.
+
+6.9 Compaction algorithm
+1. Take the lock.
+2. If there are no overwritten or deleted records to drop, we may still rewrite. The command path will be explicit so tests can force compaction.
+3. Write path + ".compacting" as a new file.
+4. Write a new header with generation + 1, fsync.
+5. Write SNAPSHOT_START with the live key count.
+6. Write one PUT per live key, in sorted key order so dumps are explainable. Sorting a million keys has a cost. We will measure it. If it threatens the 2-second budget, snapshot order can be dictionary order and dump will sort at print time. Dump sorting is required only for the dump command, not for the file.
+7. Write SNAPSHOT_END.
+8. fsync the temp file.
+9. os.replace(temp, real path). On Windows, replacing a file that is still open can fail. We will close our handle, replace, then reopen and rebuild the index from the new file. The rebuild is of live keys only.
+10. If replace fails, the old file is still in place. We delete the temp if we can, and we return an error. Data is unchanged.
+11. A kill before step 9 leaves the old file. A kill during step 9 is the operating system's replace. We will document that we rely on os.replace being atomic on NTFS for two files on the same volume, and that we have to test it rather than assume it. If a test shows a zero-length file, we stop and fix the swap before claiming C4.
+
+6.10 Concurrency
+One lock. get copies the value while holding the lock, then returns the copy, so the caller cannot observe a later mutation through a shared bytearray. We will store bytes objects, which cannot be edited in place.
+Writers do not release the lock during fsync. That means a second writer waits. The PDF allows this. It also means a get waits, so it cannot see the middle of a batch.
+Two processes: the lock file is acquired with the Windows standard-library file lock for the whole operation, and the in-process lock covers threads. If the lock file cannot be taken, the operation fails with a clear error instead of corrupting the file.
+
+6.11 Error handling
+Bad key length, bad value length, bad batch size, unknown batch line: error, no commit.
+Disk cap: error, no commit.
+A short write or an OSError in the middle: truncate to checkpoint, fsync, return the error.
+check never truncates. open does.
+CLI prints the error text and uses a non-zero exit code.
+serve prints ERR op-id message and keeps running, so one bad operation does not kill the process the judge is trying to crash on purpose.
+
+6.12 Performance plan for one million keys
+We will store bytes keys and values in one dictionary.
+We will read the file in large chunks, not one byte at a time.
+We will parse with struct.unpack_from on a memoryview so Python does not copy every header.
+We will avoid JSON and pickle. They are slow and pickle is unsafe.
+We will compact before the million-key recovery demo so recovery reads a snapshot of live keys, not a long history of overwrites.
+We will time open() and write the number down. Until that number exists, we say "target under 2 seconds, not yet measured."
+
+
+PART 7. TESTING PLAN
+
+7.1 Requirement-to-test map
+put/get/delete basic: tests/test_basic.py
+empty value: test_basic.py
+key of 1024 bytes and value of 1 MB: test_limits.py
+missing key returns NOTFOUND: test_basic.py
+invalid key length 0 and 1025, value over 1 MB, batch over 10,000: test_limits.py
+batch success: test_batch.py
+batch failure rolls back: test_batch.py
+batch atomicity under kill: torture mode batches
+two writers: tests/test_concurrent.py and torture with two writer threads
+reader during batch: test_concurrent.py
+torn tail and 1-byte chop: test_recovery.py for F4 and A2
+restart: test_recovery.py
+recovery twice: test_recovery.py for F2
+disk full: test_diskfull.py for E1 to E5
+compaction kill: torture mode compaction
+1,000,000 key recovery time: torture or a dedicated bench script, recorded in BREAKING.md
+500 kills: torture default mode
+
+7.2 The torture loop
+1. Start python src/cli.py serve PATH as a child process.
+2. Wait for READY.
+3. Two threads send random puts, deletes, and batches. A shared seed makes the random choices repeatable.
+4. When a line ACK id arrives, append that operation to the oracle file before sending more work. The oracle is the tool's file, not the database file.
+5. A third schedule sleeps a random number of milliseconds, then calls process.kill(). That is TerminateProcess on Windows. It is not a gentle shutdown.
+6. Start the database again with open, run check, run dump.
+7. Replay the oracle in order against an empty expected dictionary. Compare to dump.
+8. Print one summary line. On the first mismatch, stop and print the op ids, the expected value, and the found value.
+9. Repeat. Default 500.
+
+Modes and flags:
+--iterations N
+--seed N  (mandatory)
+--mode default
+--mode large-values
+--mode large-batches
+--mode compaction
+--mode recovery-crash
+--mode disk-full
+
+recovery-crash starts serve and kills it during the READY window, then opens again and checks the oracle.
+compaction triggers compaction, then kills during it, then checks.
+disk-full uses a small --max-bytes and expects ERR for the write that does not fit, then checks that older ACKs remain.
+
+7.3 Seeds
+We will record every seed we actually run, the date, the iteration count, and the pass or fail. The judge will pick a new seed. The tool must honour the seed for the operation stream. The kill delay is also drawn from that seed, so a failure can be repeated.
+
+7.4 What we will not say
+We will not say "all tests passed" unless the terminal output is in front of us.
+We will not say "crash-safe" until the kill loop has been run.
+We will not say "atomic" until a kill mid-batch shows zero partial keys.
+We will not say "under 2 seconds" until we have timed 1,000,000 keys.
+We will not say "production-ready".
+
+
+PART 8. WORK PLAN AFTER YOU APPROVE
+
+Phase 0, now: this document. No engine code.
+Phase 1: header, frame codec, put/get/delete, batch, CLI, basic tests. First git commits if the clock has started.
+Phase 2: recovery truncation, the lock, compaction, the million-key timing.
+Phase 3: torture tool and all modes, 500 iterations, disk-full tests.
+Phase 4: README, ARCHITECTURE.md with the real 32 rows, BREAKING.md, PROMPTS.md, clean-clone rehearsal, and spoken crash-here practice.
+
+We will implement one piece at a time and show the test output. We will not replace the design halfway through unless a test proves the design wrong. If that happens, we stop and explain before rewriting.
+
+
+PART 9. JUDGE PRACTICE
+
+Answer shape for every crash-here question:
+1. The kill is here, so these bytes have reached the disk and these have not.
+2. The commit marker is present or absent.
+3. The next open() scans until the bad tail, truncates, and rebuilds the dictionary only from commits.
+4. Therefore get shows this.
+
+Practice 1. Death after the PUT frame is written and fsynced, before the COMMIT frame.
+On disk: a valid PUT frame, no COMMIT. Next open ignores that frame and truncates it. The key keeps its old value or stays absent. Success was not returned. This is allowed.
+
+Practice 2. Death after COMMIT fsync, before ACK.
+On disk: PUT and COMMIT, both checksums valid. Next open applies them. The key has the new value. The caller may not have seen ACK. Scenario A4 says the key must still be present.
+
+Practice 3. Death after 3 frames of a 10-op batch.
+On disk: 3 valid data frames, no COMMIT. Next open drops them. None of the 10 keys change.
+
+Practice 4. Death while truncating the tail.
+On disk: either the long torn file or the already truncated file. The committed prefix is identical. The next open truncates if needed and builds the same dictionary.
+
+Practice 5. Death before os.replace during compaction.
+On disk: the old file is complete. The temp file may be partial. Next open uses the old file and deletes the temp. No acknowledged key is lost.
+
+Practice 6. Two threads write the same key.
+The lock lets one full put finish, including fsync and dictionary update, before the other starts. The final value is one of the two full values, never a splice of their bytes.
+
+Practice 7. Design extension. Add expiry.
+We would add an 8-byte expiry timestamp to the PUT payload and bump the version to 2. get would hide a key whose expiry is in the past. Compaction would drop expired keys so the file shrinks. Recovery would compare expiry to the clock while rebuilding the dictionary. Subtle problem we would say out loud: if the laptop clock jumps backwards, a key that was already expired can reappear. A second subtle problem: a batch that deletes an expired key and puts a new value must apply in order, or the new value could be dropped as expired. A third: two machines with different clocks are out of scope because we are one laptop, and we should say that.
+
+9.1 Sentences that lose points
+"It should be fine."
+"The write-ahead log makes it safe."
+"SQLite does it this way" if we cannot point at our own lines.
+"All tests passed" with no run to show.
+
+9.2 Sentences that earn points
+"The length says 40 more bytes and only 10 remain, so the CRC cannot match, so open truncates to the previous commit."
+"ACK is printed on the line after fsync returns, in cli.py, and the torture tool records the oracle only when it reads that ACK."
+"We have not verified power loss. We have verified TerminateProcess."
+"Compaction C4 is not verified yet" if that is still true. Honesty is allowed. A false mechanism is not.
+
+
+PART 10. DISQUALIFICATION TRAPS
+
+Do not pip install a database.
+Do not copy RocksDB or SQLite source into the repo.
+Do not start the repository with code written before the event. This guide is notes. The engine code starts after approval and after the clock starts.
+Do not share the repository with another team.
+During the demo, do not open ChatGPT, Cursor AI, or the web.
+Do not make the torture tool skip kills, kill only between operations, or build the oracle from dump.
+Do not hide a failed scenario. Write it in BREAKING.md with the reason.
+
+PROMPTS.md must contain the real prompts, including the long prompt that started this chat, with the tool name and the approximate time. Hiding AI use costs 10 points. An empty log that does not match the code also loses credit. We will keep the log honest.
+
+
+PART 11. WHAT IS DONE, WHAT IS NOT
+
+Completed in this phase:
+The official PDF was read from start to finish.
+Every listed limit and command was checked against it.
+The 32 scenarios were listed.
+A design was chosen and compared with alternatives.
+The byte format, write order, recovery, compaction, lock, and disk-full plan are specified.
+The test map is specified.
+
+Not done:
+No engine code.
+No tests run.
+No kill test.
+No timing measurement.
+No claim of correctness.
+
+What you should tell a judge today:
+"We spent the first hour on the invariant and the file format. We chose an append-only commit log with one in-memory dictionary and a temp-file compaction swap. We have not implemented it yet, so we are not claiming it survives kills."
+
+The exact next action:
+You approve the choices in Part 3, you tell us the project folder name, and you tell us whether the official 24-hour clock has started. After that we create the repository and implement the frame codec and a single put/get, with tests, before we build anything else.
+
+End of Phase 0 guide.

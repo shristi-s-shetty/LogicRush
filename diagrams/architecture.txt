@@ -1,0 +1,36 @@
+Clients (cli.py or a future torture tool)
+        |
+        v
+serve stdin/stdout, or a direct call
+        |
+        v
+one lock (threading.RLock + path.lock)
+        |
+        +-- memory dictionary, updated only after commit fsync
+        |
+        +-- writer in Database._write_transaction
+        |     1 check max_bytes
+        |     2 append PUT/DEL frames
+        |     3 flush + os.fsync
+        |     4 append COMMIT frame
+        |     5 flush + os.fsync
+        |     6 update dictionary
+        |     7 return, and only then may serve print ACK
+        |
+        +-- recovery in Database._recover, on every open
+        |     validate 64-byte header
+        |     delete leftover .compacting file
+        |     scan frames
+        |     apply a transaction only when its COMMIT checksum matches
+        |     truncate a torn tail
+        |
+        +-- compaction in Database.compact
+              write path.compacting
+              fsync it
+              os.replace it onto the real file
+              recover the new file
+
+Disk:
+  data.kv            the only authoritative file
+  data.kv.lock       lock file, allowed by the problem
+  data.kv.compacting temp file, never authoritative
