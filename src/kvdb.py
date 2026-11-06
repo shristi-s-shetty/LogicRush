@@ -3,14 +3,15 @@
 The file on disk is the truth. The dictionary in memory is only a contents
 page: we rebuild it by reading committed records when we open the file.
 
-A write is not real until its commit marker has been written and os.fsync
-has returned. Recovery ignores anything after the last valid commit.
+A write is not real until its TXN1 block has been written and os.fsync
+has returned. Recovery ignores a block whose checksum does not match.
 """
 
 from __future__ import annotations
 
 import os
 import struct
+import sys
 import threading
 import time
 import zlib
@@ -569,6 +570,8 @@ class Database:
         self._generation = header["generation"]
         self._max_bytes = header["max_bytes"]
         self._discard_leftover_temp()
+        if os.environ.get("KVDB_MARK_RECOVER") == "1":
+            print("RECOVER_START", file=sys.stderr, flush=True)
         scanned = _scan_records(data, self._generation, self._max_bytes)
         self._index = scanned["index"]
         self._generation = scanned["generation"]

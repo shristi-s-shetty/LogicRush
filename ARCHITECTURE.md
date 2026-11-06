@@ -115,7 +115,7 @@ Durability: `ACK` and a normal return happen after `os.fsync` of the `TXN1` bloc
 
 Atomicity: `_recover` applies a block only when the CRC of the whole body matches. A short or torn block is dropped, so a batch cannot appear as a few of its keys. `test_frames_without_commit_marker_stay_invisible` and `test_batch_that_does_not_fit_is_fully_absent` cover that. The 500-kill run below also saw in-flight batches.
 
-Recoverability: a torn tail truncates to the previous sealed block, and a second open sees a clean file. A bad header still raises. `recovery-crash` mode aims `TerminateProcess` at `open`. On a tiny file that open can finish before the kill, so the run shows the data is still intact afterwards. It does not prove the kill landed inside the replay.
+Recoverability: a torn tail truncates to the previous sealed block, and a second open sees a clean file. A bad header still raises. `recovery-large` prints `RECOVER_START` when the scan begins, then `TerminateProcess` kills that process while it is still alive. The line does not sleep. After three such kills, a clean `open` still returns every key.
 
 ## Requirement-to-proof table
 
@@ -134,7 +134,7 @@ Recoverability: a torn tail truncates to the previous sealed block, and a second
 | B4 | Batch returned | The `TXN1` block is on disk | `_write_transaction` | `test_batch_applies_in_order_and_survives_reopen` |
 | B5 | put X and del X in one batch | Applied in list order after the block parses | `_apply_ops` | `test_put_then_delete_same_key_in_one_batch` |
 | B6 | 10,000 ops, killed while the batch is in flight | The batch is all present or all absent | `_recover` | `large-batches` seed 11, `PASS 2 FAIL 0`. Both in-flight batches were fully present. No torn batch. The absent side was not observed in this run |
-| C1 | Kill during replay | Replay only reads, then truncates a tail | `_recover` | `recovery-crash` seed 42, 6 iterations, `PASS 6 FAIL 0`. Four `open` kills per iteration. The file is small, so this shows the acknowledged keys survived. It does not prove the kill hit during the scan |
+| C1 | Kill during replay | Replay only reads, then truncates a tail | `_recover` | `recovery-large` seed 42, 250,000 keys, `PASS 3 FAIL 0`. Each iteration killed `open` 3 times after `RECOVER_START`, while the process was still alive. The next open reported `keys=250000` and `check` was OK |
 | C2 | Kill during truncate | Next open truncates again to the same commit | `_recover` | not a kill during truncate |
 | C3 | Temp file partial, old file untouched | Open deletes temp | `_discard_leftover_temp` | `test_leftover_compaction_file_is_removed_and_old_data_remains` |
 | C4 | Kill on either side of `os.replace` | The old file, or the new snapshot. The call itself is one syscall | `compact`, `_pause_for_crash` | `test_kill_before_replace_keeps_the_old_file` and `test_kill_after_replace_keeps_the_new_file` |
@@ -150,6 +150,6 @@ Recoverability: a torn tail truncates to the previous sealed block, and a second
 | E4 | Cap hit during compaction | Compaction raises, old file stays if replace did not happen | `compact` | not verified under a kill |
 | E5 | Deletes, compact, write again | Snapshot drops dead keys | `compact` | `test_deletes_and_compaction_allow_writes_again` |
 | F1 | 500 kills on this format | Torture tool, TerminateProcess, oracle of ACK lines | `torture/torture.py` | `PASS 500 FAIL 0` seed 12345 on 6 Nov 2026, 221 seconds |
-| F2 | Kill during recovery more than once | Recovery truncates then only reads | `_recover` | same `recovery-crash` run as C1: four kills of `open` per iteration, then a clean open. Tiny file |
+| F2 | Kill during recovery more than once | Recovery truncates then only reads | `_recover` | Same `recovery-large` run as C1: 3 kills during the scan, then a clean open, repeated for 3 iterations |
 | F3 | 1,000,000 keys under 2 seconds | One scan of `TXN1` blocks into a dictionary | `_recover` | `torture/bench_recover.py --keys 1000000`: 1748.2 ms and 1743.7 ms, file 16.0 MB, on 6 Nov 2026. Both under 2000. Margin is a few hundred milliseconds, not a wide gap |
 | F4 | File shortened by 1 byte | Last commit fails CRC, previous commit kept | `_recover` | `test_one_byte_chop_loses_only_the_unfinished_tail` |

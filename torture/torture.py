@@ -36,6 +36,7 @@ MODES = (
     "large-batches",
     "compaction",
     "recovery-crash",
+    "recovery-large",
     "disk-full",
 )
 
@@ -46,6 +47,7 @@ def main(argv=None) -> int:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--mode", choices=MODES, default="default")
     parser.add_argument("--work-dir", default=None)
+    parser.add_argument("--keys", type=int, default=250_000)
     args = parser.parse_args(argv)
     if args.iterations < 1:
         print("iterations must be at least 1", file=sys.stderr)
@@ -63,10 +65,14 @@ def main(argv=None) -> int:
     baseline: dict[str, str] = {}
     passed = 0
     try:
+        if args.mode == "recovery-large":
+            _build_large(db_path, args.keys)
         for iteration in range(1, args.iterations + 1):
             rng = random.Random(_mix(args.seed, iteration, 0))
             if args.mode == "recovery-crash":
                 baseline = _iteration_recovery(iteration, rng, db_path, oracle_path, baseline, args)
+            elif args.mode == "recovery-large":
+                _iteration_recovery_large(iteration, db_path, args.keys)
             else:
                 baseline = _iteration_serve(iteration, rng, db_path, oracle_path, baseline, args)
             passed += 1
@@ -166,6 +172,82 @@ def _iteration_recovery(iteration, rng, db_path, oracle_path, baseline, args):
         flush=True,
     )
     return verdict["state"]
+
+
+def _build_large(db_path: Path, keys: int) -> None:
+    """Write one file big enough that the scan is still running when we kill."""
+    sys.path.insert(0, str(ROOT / "src"))
+    import kvdb
+
+    db = kvdb.Database()
+    db.open(str(db_path))
+    started = time.perf_counter()
+    try:
+        for start in range(0, keys, kvdb.MAX_BATCH):
+            count = min(kvdb.MAX_BATCH, keys - start)
+            ops = [("put", f"k{i:07d}".encode(), b"v") for i in range(start, start + count)]
+            db.batch(ops)
+    finally:
+        db.close()
+    size = db_path.stat().st_size
+    print(
+        f"built keys={keys} file_mb={size / 1e6:.1f} write_s={time.perf_counter() - started:.2f}",
+        flush=True,
+    )
+
+
+def _iteration_recovery_large(iteration, db_path, keys: int) -> None:
+    """Kill open() after the scan has started, then open the same file cleanly.
+
+    KVDB_MARK_RECOVER prints one line and does not sleep. The kill is
+    TerminateProcess while the scan is the work left in that process.
+    """
+    hits = 0
+    for wait_ms in (0, 80, 200):
+        proc, stderr_lines = _spawn(["open", str(db_path)], None, {"KVDB_MARK_RECOVER": "1"})
+        started = threading.Event()
+
+        def watch(proc=proc, sink=stderr_lines, flag=started):
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                sink.append(line)
+                if line.strip() == "RECOVER_START":
+                    flag.set()
+
+        threading.Thread(target=watch, daemon=True).start()
+        if not started.wait(60):
+            if proc.poll() is None:
+                proc.kill()
+            _finish_child(proc)
+            raise RuntimeError("open did not reach the scan\n" + "".join(stderr_lines))
+        if wait_ms:
+            time.sleep(wait_ms / 1000.0)
+        if proc.poll() is None:
+            proc.kill()
+            hits += 1
+        _finish_child(proc)
+    if hits == 0:
+        raise RuntimeError("every open finished before the kill; the file was not large enough")
+    opened = _run_open(db_path, None)
+    if opened.returncode != 0:
+        raise RuntimeError(f"open after recovery kills failed\n{opened.stderr}\n{opened.stdout}")
+    checked = _call_cli(["check", str(db_path)])
+    if checked.returncode != 0 or checked.stdout.strip() != "OK":
+        raise RuntimeError(f"check after recovery kills failed\n{checked.stdout}\n{checked.stderr}")
+    first = _call_cli(["get", str(db_path), "k0000000"])
+    last = _call_cli(["get", str(db_path), f"k{keys - 1:07d}"])
+    line = opened.stdout.strip()
+    if not line.startswith(f"keys={keys} "):
+        raise RuntimeError(f"key count changed after recovery kills: {line}")
+    if first.stdout.strip() != "v" or last.stdout.strip() != "v":
+        raise RuntimeError(
+            f"sample keys missing after recovery kills: first={first.stdout!r} last={last.stdout!r}"
+        )
+    print(
+        f"iter={iteration} killed_during_scan={hits} keys={keys} check=OK final_open={line}",
+        flush=True,
+    )
 
 
 def _clean_writes(iteration, rng, db_path, oracle_path, baseline):
@@ -306,10 +388,13 @@ def _inspect(db_path, baseline, submitted, results, max_bytes):
         ) from exc
 
 
-def _spawn(command, max_bytes):
+def _spawn(command, max_bytes, env_extra=None):
     cmd = [sys.executable, "-u", str(CLI), *command]
     if max_bytes is not None:
         cmd.extend(["--max-bytes", str(max_bytes)])
+    env = os.environ.copy()
+    if env_extra:
+        env.update(env_extra)
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -320,6 +405,7 @@ def _spawn(command, max_bytes):
         errors="replace",
         bufsize=1,
         cwd=str(ROOT),
+        env=env,
     )
     return proc, []
 
