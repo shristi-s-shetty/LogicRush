@@ -26,14 +26,23 @@ The data frames are fsynced before the COMMIT frame is written. A COMMIT whose C
 3. `os.replace` during compaction has not been killed. A failed replace on OneDrive could be different from a local NTFS disk.
 4. The project lives under OneDrive. Sync clients can lock the file or delay durability. Demo from a normal local folder.
 5. `check` runs after `open`, and `open` already truncates a torn tail. So `check` on our CLI sees a repaired file. It does not detect bit rot in the middle of an old commit. The problem does not require bit-rot repair.
-6. There is no torture tool yet, so group F is not demonstrated.
+6. One million keys have not been timed. Group F1 has now been run; F3 has not.
 
 ## 4. What we tried that failed
 
-Nothing has failed in the 20 unit tests run on 6 Nov 2026. That sentence is not a victory. Those tests chop a file by hand. They do not kill a running process. The empty space here is the missing torture tool, and it is the next thing we build.
+On 6 Nov 2026 the torture tool passed these runs. Nothing failed, so this section records what the runs actually were, not a fake bug.
+
+- `python torture/torture.py --iterations 500 --seed 12345` -> `PASS 500 FAIL 0` in 269 seconds. Kill is `TerminateProcess`. Two writer threads. Oracle records only lines that start with `ACK`. Several iterations were `with-inflight`: the killed operation had reached disk before we saw `ACK`.
+- `--iterations 4 --seed 999 --mode disk-full` -> pass. After the file hit the cap, later iterations had `acks=0` and the old keys were still intact.
+- `--iterations 4 --seed 7 --mode compaction` -> pass, including kills while compact commands were in the stream. This does not prove the kill landed inside `os.replace`.
+- `--iterations 4 --seed 42 --mode recovery-crash` -> pass. After that, the mode was changed to kill `open` four times per iteration, including an immediate kill. A fresh `--iterations 3 --seed 42 --mode recovery-crash` also passed.
+- `--iterations 1 --seed 3 --mode large-values` -> 12 acknowledged 1 MB puts survived; the 13th was in flight and absent (`without-inflight`).
+- `--iterations 1 --seed 11 --mode large-batches` -> two acknowledged batches of 10,000 puts survived; the third batch was in flight and absent.
+
+The hand-chop unit tests still exist. They are a different test from process kill.
 
 ## 5. If we had 24 more hours
 
-1. A torture tool that kills with `TerminateProcess` at a random millisecond, with an oracle that records only real ACK lines, and seeds.
-2. A timed open of 1,000,000 small keys, and a compaction before that open if the replay is slow.
-3. A kill during `os.replace`, and a kill during `_recover`'s truncate, with the same seed printed on failure.
+1. Time `open` on 1,000,000 small keys, and compact first if the replay is slower than 2 seconds.
+2. A kill that is aimed at the `os.replace` line, not just at a serve process that sometimes happens to be compacting.
+3. Move the demo copy off OneDrive onto a normal local disk.

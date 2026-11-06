@@ -73,8 +73,25 @@ The first line from serve is `READY <keys> <recovery_ms>`.
 - One batch: at most 10,000 operations.
 - `--max-bytes N` refuses a write that would make the data file larger than N. The temporary compaction file is separate.
 
+## Torture tool
+
+The referee is a separate program. It does not trust the database to grade itself. It writes an oracle log only when it reads `ACK` from the child process. The kill is `subprocess.Popen.kill()`, which on Windows is `TerminateProcess`.
+
+```bat
+python torture\torture.py --iterations 500 --seed 12345
+python torture\torture.py --iterations 100 --seed 999 --mode large-values
+python torture\torture.py --iterations 100 --seed 7 --mode compaction
+python torture\torture.py --iterations 100 --seed 42 --mode recovery-crash
+python torture\torture.py --iterations 100 --seed 42 --mode disk-full
+python torture\torture.py --iterations 100 --seed 7 --mode large-batches
+```
+
+`--seed` is required. On 6 Nov 2026, `--iterations 500 --seed 12345` finished `PASS 500 FAIL 0` in 269 seconds on this laptop. Some iterations matched `with-inflight`: the commit was already on disk before the tool read `ACK`. That is scenario A4, and it is legal.
+
+The database file for a torture run is created under the system temp folder, not under OneDrive.
+
 ## What is not proven yet
 
-Unit tests cover put/get/delete, batch order, a torn tail, a one-byte chop, disk-full refusal, two threads, and compaction shrink. They do **not** yet kill the process with `TerminateProcess` 500 times. Do not tell a judge this is crash-proven until `torture/` has been run. That tool is the next piece of work.
+Unit tests cover put/get/delete, batch order, a torn tail, a one-byte chop, disk-full refusal, two threads, and compaction shrink. The 500-kill run above is real. It is a process kill, not a power cut. One million keys have not been timed. A kill has not been aimed at the single `os.replace` line inside compaction.
 
 The project folder is under OneDrive. OneDrive can lock files and delay disk writes. For the demo, copy the repository to a normal local folder such as `C:\kvdemo` if kills start behaving strangely.

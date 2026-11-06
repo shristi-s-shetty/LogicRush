@@ -143,7 +143,7 @@ Recoverability: a torn tail truncates to the previous commit, and a second open 
 | E3 | Cap hit, then killed | No partial commit was written | same | not a kill |
 | E4 | Cap hit during compaction | Compaction raises, old file stays if replace did not happen | `compact` | not verified under a kill |
 | E5 | Deletes, compact, write again | Snapshot drops dead keys | `compact` | `test_deletes_and_compaction_allow_writes_again` |
-| F1 | 500 kills | Would use the torture tool | not built | not verified |
+| F1 | 500 kills | Torture tool, TerminateProcess, oracle of ACK lines | `torture/torture.py` | `PASS 500 FAIL 0` seed 12345 on 6 Nov 2026, 269 seconds |
 | F2 | Kill during recovery twice | Recovery truncates then only reads | `_recover` | second open after a torn tail, not a kill |
 | F3 | 1,000,000 keys under 2 seconds | Not measured | `_recover` | not verified |
 | F4 | File shortened by 1 byte | Last commit fails CRC, previous commit kept | `_recover` | `test_one_byte_chop_loses_only_the_unfinished_tail` |
