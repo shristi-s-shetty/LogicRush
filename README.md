@@ -91,8 +91,16 @@ python torture\torture.py --iterations 100 --seed 7 --mode large-batches
 
 The database file for a torture run is created under the system temp folder, not under OneDrive.
 
+## Demo folder
+
+OneDrive can lock files. The copy used for judging is `C:\kvdemo`, which is not under OneDrive. On 6 Nov 2026 that copy ran 29 unit tests OK in 1.8 seconds, `put`/`get`/`check` on `data.kv` (`red`, then `OK`), and `python torture\torture.py --iterations 2 --seed 12345` finished `PASS 2 FAIL 0`. Refresh it after new commits with:
+
+```bat
+robocopy C:\Users\User\OneDrive\Desktop\LogicRush C:\kvdemo /E /XD __pycache__
+```
+
 ## What is not proven yet
 
 Unit tests cover put/get/delete, batch order, a torn tail, a one-byte chop, disk-full refusal, two threads, and compaction shrink. The 500-kill run above is a process kill, not a power cut. Opening 1,000,000 keys measured 1748.2 ms and 1743.7 ms (`python torture/bench_recover.py --keys 1000000`, file 16.0 MB). On this same format, 6 Nov 2026: `disk-full` seed 999, 8 iterations, pass; `recovery-crash` seed 42, 6 iterations, pass on a tiny file; `recovery-large` seed 42, 250,000 keys, 3 iterations, pass, with 3 kills per iteration after the scan had started; `compaction` seed 7, 6 iterations, pass (this does not aim the kill at `os.replace`); `large-values` seed 3, 2 iterations, pass, and the one unacknowledged 1 MB put was absent; `large-batches` seed 11, 2 iterations, pass, and both in-flight batches of 10,000 were fully present. `tests/test_replace_kill.py` kills the process on the pause immediately before `os.replace` and on the pause immediately after it. The kill is not inside the kernel call itself.
 
-The project folder is under OneDrive. OneDrive can lock files and delay disk writes. For the demo, copy the repository to a normal local folder such as `C:\kvdemo` if kills start behaving strangely.
+The project folder is under OneDrive. The demo copy is `C:\kvdemo`. Use that folder when a judge is driving.
