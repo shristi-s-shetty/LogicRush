@@ -35,7 +35,7 @@ class DiskFullTests(unittest.TestCase):
 
     def test_batch_that_does_not_fit_is_fully_absent(self):
         db = kvdb.Database()
-        db.open(self.path, max_bytes=180)
+        db.open(self.path, max_bytes=120)
         db.put(b"keep", b"yes")
         with self.assertRaises(kvdb.DiskFullError):
             db.batch(
@@ -52,7 +52,7 @@ class DiskFullTests(unittest.TestCase):
 
     def test_deletes_and_compaction_allow_writes_again(self):
         db = kvdb.Database()
-        db.open(self.path, max_bytes=5000)
+        db.open(self.path, max_bytes=2000)
         db.put(b"big", b"q" * 800)
         with self.assertRaises(kvdb.DiskFullError):
             db.put(b"more", b"z" * 4000)

@@ -16,29 +16,27 @@ import time
 import zlib
 
 MAGIC = b"KVDB"
-VERSION = 1
+VERSION = 2
 HEADER_SIZE = 64
-
-FRAME_MAGIC = b"FRM1"
-KIND_PUT = 1
-KIND_DEL = 2
-KIND_COMMIT = 3
-KIND_SNAP_START = 4
-KIND_SNAP_END = 5
-KIND_META = 6
+TXN_MAGIC = b"TXN1"
+SNP_MAGIC = b"SNP1"
+OP_PUT = 1
+OP_DEL = 2
+OP_META = 6
 
 MAX_KEY = 1024
 MAX_VALUE = 1024 * 1024
 MAX_BATCH = 10_000
-# A frame has to be able to hold one 1 MB value, and no larger.
-MAX_FRAME = MAX_VALUE + MAX_KEY + 64
 
 _HEADER = struct.Struct("<4sIIIQQQ20s")
-_FRAME_PREFIX = struct.Struct("<4sIHHQI")
 _U32 = struct.Struct("<I")
-_U64 = struct.Struct("<Q")
-_U32U32 = struct.Struct("<II")
-_U64U64 = struct.Struct("<QQ")
+# magic, txn id, op count, body length, crc of the body. 24 bytes.
+_TXN_HEAD = struct.Struct("<4sQIII")
+# magic, txn id, generation, key count, body length, crc of the body. 36 bytes.
+_SNP_HEAD = struct.Struct("<4sQQQII")
+_PUT_OP = struct.Struct("<BHI")
+_DEL_OP = struct.Struct("<BH")
+_META_OP = struct.Struct("<BQ")
 
 
 class KvError(Exception):
@@ -51,6 +49,17 @@ class DiskFullError(KvError):
 
 def _crc(data: bytes) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def _pause_for_crash(point: str) -> None:
+    """Wait so an outside test can kill us at one named line.
+
+    The database never sets this itself. Torture sets KVDB_CRASH_AT.
+    """
+    if os.environ.get("KVDB_CRASH_AT") != point:
+        return
+    print(f"CRASH_AT {point}", flush=True)
+    time.sleep(30)
 
 
 def _as_bytes(data, what: str, min_len: int, max_len: int) -> bytes:
@@ -106,68 +115,185 @@ def parse_header(data: bytes) -> dict:
     }
 
 
-def pack_frame(kind: int, txn: int, payload: bytes) -> bytes:
-    frame_len = 24 + len(payload) + 4
-    if frame_len > MAX_FRAME:
-        raise KvError("record is larger than the format allows")
-    prefix = _FRAME_PREFIX.pack(FRAME_MAGIC, frame_len, kind, 0, txn, len(payload))
-    without_crc = prefix + payload
-    return without_crc + _U32.pack(_crc(without_crc))
+def pack_transaction(txn: int, ops) -> bytes:
+    """One sealed block. The checksum covers every operation, so recovery applies all or none."""
+    body = _pack_ops(ops)
+    return _TXN_HEAD.pack(TXN_MAGIC, txn, len(ops), len(body), _crc(body)) + body
 
 
-def try_parse_frame(data: bytes, pos: int):
-    """Return a frame dict, or None if the bytes at pos are not a full valid frame.
+def pack_snapshot(txn: int, generation: int, items) -> bytes:
+    """A compacted file: only the live keys, with one checksum for the whole picture."""
+    parts = []
+    for key, value in items:
+        parts.append(_PUT_OP.pack(OP_PUT, len(key), len(value)) + key + value)
+    body = b"".join(parts)
+    head = _SNP_HEAD.pack(SNP_MAGIC, txn, generation, len(items), len(body), _crc(body))
+    return head + body
 
-    None means "stop here". A torn tail and a bad checksum both return None.
-    We do not raise, because a crash is allowed to leave junk at the end.
+
+def _pack_ops(ops) -> bytes:
+    parts = []
+    for op in ops:
+        if op[0] == "put":
+            key, value = op[1], op[2]
+            parts.append(_PUT_OP.pack(OP_PUT, len(key), len(value)) + key + value)
+        elif op[0] == "del":
+            key = op[1]
+            parts.append(_DEL_OP.pack(OP_DEL, len(key)) + key)
+        elif op[0] == "meta":
+            parts.append(_META_OP.pack(OP_META, op[1]))
+        else:
+            raise KvError(f"cannot write {op[0]}")
+    return b"".join(parts)
+
+
+def _scan_records(data: bytes, generation: int, max_bytes: int) -> dict:
+    """Rebuild the dictionary from sealed blocks only.
+
+    A block counts when its checksum matches and its body is fully present.
+    A torn tail fails that test and is left behind last_good for truncation.
+    One million keys are stored as plain records inside a block, not as a
+    separate frame per key, so this loop stays inside the 2 second limit.
     """
-    remain = len(data) - pos
-    if remain < 28:
-        return None
-    magic, frame_len, kind, _flags, txn, plen = _FRAME_PREFIX.unpack_from(data, pos)
-    if magic != FRAME_MAGIC:
-        return None
-    if frame_len < 28 or frame_len > MAX_FRAME or plen != frame_len - 28:
-        return None
-    if frame_len > remain:
-        return None
-    end = pos + frame_len
-    without_crc = data[pos : end - 4]
-    stored = _U32.unpack_from(data, end - 4)[0]
-    if _crc(without_crc) != stored:
-        return None
+    index: dict[bytes, bytes] = {}
+    last_good = HEADER_SIZE
+    max_txn = 0
+    size = len(data)
+    pos = HEADER_SIZE
+    while pos + 4 <= size:
+        magic = data[pos : pos + 4]
+        if magic == TXN_MAGIC:
+            if pos + 24 > size:
+                break
+            _magic, txn, count, body_len, crc = _TXN_HEAD.unpack_from(data, pos)
+            body_at = pos + 24
+            body_end = body_at + body_len
+            if body_end > size or _crc(data[body_at:body_end]) != crc:
+                break
+            updated = _apply_ops(index, data, body_at, body_end, count, max_bytes)
+            if updated is None:
+                break
+            max_bytes = updated
+            if txn > max_txn:
+                max_txn = txn
+            last_good = body_end
+            pos = body_end
+        elif magic == SNP_MAGIC:
+            if pos + 36 > size:
+                break
+            _magic, txn, generation, count, body_len, crc = _SNP_HEAD.unpack_from(data, pos)
+            body_at = pos + 36
+            body_end = body_at + body_len
+            if body_end > size or _crc(data[body_at:body_end]) != crc:
+                break
+            fresh: dict[bytes, bytes] = {}
+            if _fill_puts(fresh, data, body_at, body_end, count) is None:
+                break
+            index = fresh
+            if txn > max_txn:
+                max_txn = txn
+            last_good = body_end
+            pos = body_end
+        else:
+            break
     return {
-        "kind": kind,
-        "txn": txn,
-        "payload": data[pos + 24 : end - 4],
-        "end": end,
+        "index": index,
+        "last_good": last_good,
+        "max_txn": max_txn,
+        "max_bytes": max_bytes,
+        "generation": generation,
     }
 
 
-def pack_put_payload(key: bytes, value: bytes) -> bytes:
-    return _U32U32.pack(len(key), len(value)) + key + value
+def _apply_ops(index, data, start, end, count, max_bytes):
+    """Parse the whole body, then store it.
+
+    Offsets are recorded first. The dictionary changes only after every
+    operation in the block has a legal length, so a bad body cannot leave
+    half of its keys behind.
+    """
+    pos = start
+    seen = 0
+    ops = []
+    unpack_put = _PUT_OP.unpack_from
+    unpack_del = _DEL_OP.unpack_from
+    unpack_meta = _META_OP.unpack_from
+    while seen < count:
+        if pos >= end:
+            return None
+        kind = data[pos]
+        if kind == OP_PUT:
+            if pos + 7 > end:
+                return None
+            _kind, key_len, value_len = unpack_put(data, pos)
+            key_at = pos + 7
+            value_at = key_at + key_len
+            next_pos = value_at + value_len
+            if (
+                key_len < 1
+                or key_len > MAX_KEY
+                or value_len > MAX_VALUE
+                or next_pos > end
+            ):
+                return None
+            ops.append((OP_PUT, key_at, value_at, next_pos))
+            pos = next_pos
+        elif kind == OP_DEL:
+            if pos + 3 > end:
+                return None
+            _kind, key_len = unpack_del(data, pos)
+            key_at = pos + 3
+            next_pos = key_at + key_len
+            if key_len < 1 or key_len > MAX_KEY or next_pos > end:
+                return None
+            ops.append((OP_DEL, key_at, next_pos))
+            pos = next_pos
+        elif kind == OP_META:
+            if pos + 9 > end:
+                return None
+            _kind, max_bytes = unpack_meta(data, pos)
+            ops.append((OP_META, max_bytes))
+            pos += 9
+        else:
+            return None
+        seen += 1
+    if pos != end:
+        return None
+    for op in ops:
+        kind = op[0]
+        if kind == OP_PUT:
+            index[data[op[1] : op[2]]] = data[op[2] : op[3]]
+        elif kind == OP_DEL:
+            index.pop(data[op[1] : op[2]], None)
+        else:
+            max_bytes = op[1]
+    return max_bytes
 
 
-def parse_put_payload(payload: bytes):
-    if len(payload) < 8:
+def _fill_puts(index, data, start, end, count):
+    pos = start
+    unpack = _PUT_OP.unpack_from
+    for _ in range(count):
+        if pos + 7 > end:
+            return None
+        kind, key_len, value_len = unpack(data, pos)
+        key_at = pos + 7
+        value_at = key_at + key_len
+        next_pos = value_at + value_len
+        if (
+            kind != OP_PUT
+            or key_len < 1
+            or key_len > MAX_KEY
+            or value_len > MAX_VALUE
+            or next_pos > end
+        ):
+            return None
+        index[data[key_at:value_at]] = data[value_at:next_pos]
+        pos = next_pos
+    if pos != end:
         return None
-    klen, vlen = _U32U32.unpack_from(payload, 0)
-    if not (1 <= klen <= MAX_KEY) or vlen > MAX_VALUE:
-        return None
-    if len(payload) != 8 + klen + vlen:
-        return None
-    key = payload[8 : 8 + klen]
-    value = payload[8 + klen :]
-    return key, value
+    return index
 
-
-def parse_del_payload(payload: bytes):
-    if len(payload) < 4:
-        return None
-    (klen,) = _U32.unpack_from(payload, 0)
-    if not (1 <= klen <= MAX_KEY) or len(payload) != 4 + klen:
-        return None
-    return payload[4:]
 
 
 def escape_bytes(data: bytes) -> str:
@@ -333,18 +459,8 @@ class Database:
             self._ensure_open()
             items = sorted(self._index.items())
             txn = self._next_txn
-            frames = [pack_frame(KIND_SNAP_START, txn, _U64.pack(len(items)))]
-            for key, value in items:
-                frames.append(pack_frame(KIND_PUT, txn, pack_put_payload(key, value)))
             new_generation = self._generation + 1
-            frames.append(
-                pack_frame(
-                    KIND_SNAP_END,
-                    txn,
-                    _U64U64.pack(len(items), new_generation),
-                )
-            )
-            blob = b"".join(frames)
+            blob = pack_snapshot(txn, new_generation, items)
             header = pack_header(new_generation, self._max_bytes, HEADER_SIZE + len(blob))
             new_size = len(header) + len(blob)
             if self._max_bytes and new_size > self._max_bytes:
@@ -361,6 +477,11 @@ class Database:
             os.fsync(self._file.fileno())
             self._file.close()
             self._file = None
+            # os.replace is one operating-system call. A process kill lands
+            # either before it or after it. These two pauses exist so a test
+            # can TerminateProcess on each side of that call. They do nothing
+            # unless KVDB_CRASH_AT is set.
+            _pause_for_crash("before-replace")
             try:
                 os.replace(tmp, self._path)
             except Exception:
@@ -369,6 +490,7 @@ class Database:
                 if os.path.exists(tmp):
                     os.remove(tmp)
                 raise
+            _pause_for_crash("after-replace")
             self._file = open(self._path, "r+b")
             self._recover()
             self._next_txn = max(self._next_txn, txn + 1)
@@ -380,20 +502,12 @@ class Database:
             self._file.seek(0)
             data = self._file.read()
             try:
-                parse_header(data[:HEADER_SIZE])
+                header = parse_header(data[:HEADER_SIZE])
             except KvError as exc:
                 return str(exc)
-            pos = HEADER_SIZE
-            last_good = HEADER_SIZE
-            while pos < len(data):
-                frame = try_parse_frame(data, pos)
-                if frame is None:
-                    return f"torn or invalid tail at byte {pos}"
-                if frame["kind"] in (KIND_COMMIT, KIND_SNAP_END):
-                    last_good = frame["end"]
-                pos = frame["end"]
-            if last_good != len(data):
-                return f"file has {len(data) - last_good} bytes after the last commit"
+            scanned = _scan_records(data, header["generation"], header["max_bytes"])
+            if scanned["last_good"] != len(data):
+                return f"torn or invalid tail at byte {scanned['last_good']}"
             return "OK"
 
     def items(self):
@@ -455,94 +569,12 @@ class Database:
         self._generation = header["generation"]
         self._max_bytes = header["max_bytes"]
         self._discard_leftover_temp()
-
-        index: dict[bytes, bytes] = {}
-        last_good = HEADER_SIZE
-        pending = []
-        pending_txn = None
-        snap_puts = None
-        snap_expect = None
-        max_txn = 0
-        pos = HEADER_SIZE
-
-        while pos < len(data):
-            frame = try_parse_frame(data, pos)
-            if frame is None:
-                break
-            kind = frame["kind"]
-            txn = frame["txn"]
-            payload = frame["payload"]
-            max_txn = max(max_txn, txn)
-
-            if kind == KIND_PUT:
-                parsed = parse_put_payload(payload)
-                if parsed is None:
-                    break
-                if snap_puts is not None:
-                    snap_puts.append(parsed)
-                else:
-                    if pending_txn is None:
-                        pending_txn = txn
-                    if txn != pending_txn:
-                        break
-                    pending.append(("put", parsed[0], parsed[1]))
-            elif kind == KIND_DEL:
-                if snap_puts is not None:
-                    break
-                key = parse_del_payload(payload)
-                if key is None:
-                    break
-                if pending_txn is None:
-                    pending_txn = txn
-                if txn != pending_txn:
-                    break
-                pending.append(("del", key))
-            elif kind == KIND_META:
-                if snap_puts is not None or len(payload) != 8:
-                    break
-                (new_cap,) = _U64.unpack(payload)
-                if pending_txn is None:
-                    pending_txn = txn
-                if txn != pending_txn:
-                    break
-                pending.append(("meta", new_cap))
-            elif kind == KIND_COMMIT:
-                if snap_puts is not None or len(payload) != 4:
-                    break
-                (count,) = _U32.unpack(payload)
-                if pending_txn != txn or count != len(pending):
-                    break
-                self._apply(index, pending)
-                for op in pending:
-                    if op[0] == "meta":
-                        self._max_bytes = op[1]
-                pending = []
-                pending_txn = None
-                last_good = frame["end"]
-            elif kind == KIND_SNAP_START:
-                if pending or snap_puts is not None or len(payload) != 8:
-                    break
-                (snap_expect,) = _U64.unpack(payload)
-                snap_puts = []
-                pending_txn = txn
-            elif kind == KIND_SNAP_END:
-                if snap_puts is None or len(payload) != 16:
-                    break
-                count, generation = _U64U64.unpack(payload)
-                if count != len(snap_puts) or count != snap_expect or txn != pending_txn:
-                    break
-                index = {key: value for key, value in snap_puts}
-                self._generation = generation
-                snap_puts = None
-                snap_expect = None
-                pending_txn = None
-                last_good = frame["end"]
-            else:
-                break
-            pos = frame["end"]
-
-        self._index = index
-        self._next_txn = max_txn + 1
+        scanned = _scan_records(data, self._generation, self._max_bytes)
+        self._index = scanned["index"]
+        self._generation = scanned["generation"]
+        self._max_bytes = scanned["max_bytes"]
+        self._next_txn = scanned["max_txn"] + 1
+        last_good = scanned["last_good"]
         self.recovered_torn_bytes = len(data) - last_good
         if last_good != len(data):
             self._file.seek(last_good)
@@ -565,37 +597,20 @@ class Database:
 
     def _write_transaction(self, ops) -> None:
         txn = self._next_txn
-        frames = []
-        for op in ops:
-            if op[0] == "put":
-                payload = pack_put_payload(op[1], op[2])
-                frames.append(pack_frame(KIND_PUT, txn, payload))
-            elif op[0] == "del":
-                payload = _U32.pack(len(op[1])) + op[1]
-                frames.append(pack_frame(KIND_DEL, txn, payload))
-            elif op[0] == "meta":
-                frames.append(pack_frame(KIND_META, txn, _U64.pack(op[1])))
-            else:
-                raise KvError(f"cannot write {op[0]}")
-        commit = pack_frame(KIND_COMMIT, txn, _U32.pack(len(ops)))
-        body = b"".join(frames)
+        block = pack_transaction(txn, ops)
         self._file.seek(0, os.SEEK_END)
         checkpoint = self._file.tell()
-        extra = len(body) + len(commit)
         limit = self._max_bytes
         # Raising the cap has to be recorded even when the file is already at the
         # old cap. The new, larger cap is the limit for that one record.
         if len(ops) == 1 and ops[0][0] == "meta" and ops[0][1] > self._max_bytes:
             limit = ops[0][1]
-        if limit and checkpoint + extra > limit:
+        if limit and checkpoint + len(block) > limit:
             raise DiskFullError(
-                f"write needs {extra} more bytes, file is {checkpoint}, max_bytes is {limit}"
+                f"write needs {len(block)} more bytes, file is {checkpoint}, max_bytes is {limit}"
             )
         try:
-            self._file.write(body)
-            self._file.flush()
-            os.fsync(self._file.fileno())
-            self._file.write(commit)
+            self._file.write(block)
             self._file.flush()
             os.fsync(self._file.fileno())
         except Exception:

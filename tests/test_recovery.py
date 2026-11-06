@@ -23,12 +23,9 @@ class RecoveryTests(unittest.TestCase):
         db.put(b"kept", b"yes")
         db.close()
 
-        torn = kvdb.pack_frame(
-            kvdb.KIND_PUT, 99, kvdb.pack_put_payload(b"ghost", b"no")
-        )
+        torn = kvdb.pack_transaction(99, [("put", b"ghost", b"no")])
         with open(self.path, "ab") as handle:
-            handle.write(torn)
-            handle.write(b"\x00\x01\x02")
+            handle.write(torn[:-1])
 
         db = kvdb.Database()
         db.open(self.path)
@@ -50,11 +47,11 @@ class RecoveryTests(unittest.TestCase):
         db.put(b"old", b"1")
         db.close()
 
-        frame = kvdb.pack_frame(
-            kvdb.KIND_PUT, 50, kvdb.pack_put_payload(b"new", b"2")
-        )
+        # A header that promises 40 body bytes, then only a few bytes. No valid checksum.
+        partial = b"TXN1" + (50).to_bytes(8, "little") + (1).to_bytes(4, "little")
+        partial += (40).to_bytes(4, "little") + (0).to_bytes(4, "little") + b"nope"
         with open(self.path, "ab") as handle:
-            handle.write(frame)
+            handle.write(partial)
 
         db = kvdb.Database()
         db.open(self.path)
@@ -68,14 +65,9 @@ class RecoveryTests(unittest.TestCase):
         db.open(self.path)
         db.close()
 
-        txn = 1
-        put = kvdb.pack_frame(kvdb.KIND_PUT, txn, kvdb.pack_put_payload(b"k", b"v"))
-        commit = kvdb.pack_frame(kvdb.KIND_COMMIT, txn, (1).to_bytes(4, "little"))
+        block = kvdb.pack_transaction(1, [("put", b"k", b"v")])
         with open(self.path, "ab") as handle:
-            handle.write(put)
-            handle.flush()
-            os.fsync(handle.fileno())
-            handle.write(commit)
+            handle.write(block)
             handle.flush()
             os.fsync(handle.fileno())
 

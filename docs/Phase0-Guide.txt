@@ -1,7 +1,7 @@
 KILL IT AND PROVE IT
 Phase 0 study guide for a beginner team
 Architecture proposal, requirements, and judge-defense notes
-Status: proposal only. No database code has been written. Nothing here is proven yet.
+Status: early proposal. The code that exists is version 2, described in ARCHITECTURE.md. Do not answer a judge from this guide when it disagrees with that file.
 
 How to use this guide
 Read it in order. Do not skip Section 4 of the official problem (the invariant). That one rule decides the score.

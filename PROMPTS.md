@@ -26,10 +26,12 @@ will you?
 
 go
 
+## 15:57 — fourth prompt, unedited
+
+next?
+
 ## Decisions after those prompts
 
 We read the official 19-page PDF before choosing a design. We did not start the engine until the team approved an append-only commit log. The team said the clock had started and chose the folder `C:\Users\User\OneDrive\Desktop\LogicRush`.
 
-Architecture choice: one data file, frames with CRC32, a COMMIT marker after fsync, an in-memory dictionary updated only after that fsync, compaction by writing a temp snapshot and `os.replace`.
-
-Implementation so far: `src/kvdb.py`, `src/cli.py`, and 20 unit tests. Those tests passed. Process-kill torture is not written yet, and the docs say so on purpose.
+The first implementation used one frame per operation and two `os.fsync` calls. Replaying that log was too slow for 1,000,000 keys. The current file is version 2: one `TXN1` block per batch, one checksum of the whole body, one `os.fsync`, then the in-memory dictionary is updated. Compaction writes one `SNP1` block and swaps it in with `os.replace`.

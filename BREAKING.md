@@ -4,45 +4,52 @@
 
 | Where | If we die there, what is on disk | Next open |
 | --- | --- | --- |
-| `_write_transaction`, before `write(body)` | Old commits only | Old keys |
-| After `write(body)`, before the first fsync returns | Data frames may be partial | Torn frame ignored, truncated |
-| After the first fsync, before `write(commit)` | Full data frames, no COMMIT | Transaction invisible |
-| After `write(commit)`, before the second fsync returns | COMMIT may be partial | All of the transaction if the CRC matches, else none |
-| After the second fsync, before `return` | Full COMMIT | Transaction visible. This is scenario A4 |
-| `serve`, after return, before `print ACK` | Same as a successful return | Visible, even if the tool missed the ACK. The tool must only record an ACK it actually read |
-| `_recover`, during `truncate` | Either the long file or the already short file | Both share the same committed prefix |
-| `compact`, before `os.replace` | Old file complete, temp maybe partial | Old file. Temp deleted |
-| `compact`, inside `os.replace` | One complete file, old or new | Whichever name won |
-| `close`, during its fsync | Last commit already fsynced by the write path | Same as any other kill |
+| `_write_transaction`, before `write` of the block | Old sealed blocks only | Old keys |
+| After `write` of the `TXN1` block, before `os.fsync` returns | The block may be partial | Torn block ignored, tail truncated |
+| After `os.fsync` returns, before `return` | Full block, CRC matches | Block visible. This is scenario A4 |
+| `serve`, after return, before `print ACK` | Same as a successful return | Visible, even if the tool missed the ACK. The tool records an ACK only when it reads one |
+| `_recover`, during `truncate` | Either the long file or the already short file | Both share the same sealed prefix |
+| `compact`, before `os.replace` | Old file complete, temp maybe partial | Old file. Temp deleted. `test_kill_before_replace_keeps_the_old_file` kills here |
+| `compact`, inside `os.replace` | One complete file, old or new | Whichever name won. We pause on the line before and the line after. We do not claim a kill in the middle of the syscall |
+| `compact`, after `os.replace` returns | New snapshot | New file. `test_kill_after_replace_keeps_the_new_file` kills here |
+| `close`, during its fsync | Last block already fsynced by the write path | Same as any other kill |
 
 ## 2. Ordering argument
 
-The data frames are fsynced before the COMMIT frame is written. A COMMIT whose CRC matches therefore sits after a complete payload. Recovery applies a transaction only when that COMMIT's operation count matches the pending frames. `os.fsync` is called on the data file, not on the directory. For a process kill after fsync, the problem says the bytes are on disk. We do not fsync the directory. We have not shown that a power cut would keep the directory entry. `os.replace` is what swaps the compaction file. We are relying on NTFS replace of two files on the same volume being one name change. That is not yet killed in a test.
+One `TXN1` block holds every operation and one CRC of that body. `os.fsync` is called once on that block, on the data file, not on the directory. Recovery applies the block only when the CRC matches and the body parses completely. For a process kill after fsync, the problem says the bytes are on disk. We do not fsync the directory. We have not shown that a power cut would keep the directory entry. `os.replace` swaps the compaction file. We kill on the pause before that call and on the pause after it. We have not killed the thread inside the kernel during the call.
 
 ## 3. Known weaknesses
 
-1. Recovery reads the whole file and rebuilds a Python dictionary. A long log of 1,000,000 keys has not been timed. It may miss the 2 second line until we compact first and measure.
+1. Opening 1,000,000 keys took 1748.2 ms and 1743.7 ms on 6 Nov 2026 (`python torture/bench_recover.py --keys 1000000`, file 16.0 MB). Both are under 2000 ms. The gap is a few hundred milliseconds. A slower laptop can miss it.
 2. One global lock means a second writer waits for fsync. That is allowed, and it makes large batches slow.
-3. `os.replace` during compaction has not been killed. A failed replace on OneDrive could be different from a local NTFS disk.
+3. The replace tests kill a 30 second pause that exists only when `KVDB_CRASH_AT` is set. They do not kill the `os.replace` syscall itself. A failed replace on OneDrive could be different from a local NTFS disk.
 4. The project lives under OneDrive. Sync clients can lock the file or delay durability. Demo from a normal local folder.
-5. `check` runs after `open`, and `open` already truncates a torn tail. So `check` on our CLI sees a repaired file. It does not detect bit rot in the middle of an old commit. The problem does not require bit-rot repair.
-6. One million keys have not been timed. Group F1 has now been run; F3 has not.
+5. `check` runs after `open`, and `open` already truncates a torn tail. So `check` on our CLI sees a repaired file. It does not detect bit rot in the middle of an old block. The problem does not require bit-rot repair.
+6. The other torture modes (large values, large batches, disk full, recovery crash, compaction-during-serve) were measured on the previous format. The current format has the 500-kill default run and the replace-pause tests.
 
 ## 4. What we tried that failed
 
-On 6 Nov 2026 the torture tool passed these runs. Nothing failed, so this section records what the runs actually were, not a fake bug.
+These runs passed. They are split by file format so an old number is not quoted as a result for the current code.
 
-- `python torture/torture.py --iterations 500 --seed 12345` -> `PASS 500 FAIL 0` in 269 seconds. Kill is `TerminateProcess`. Two writer threads. Oracle records only lines that start with `ACK`. Several iterations were `with-inflight`: the killed operation had reached disk before we saw `ACK`.
-- `--iterations 4 --seed 999 --mode disk-full` -> pass. After the file hit the cap, later iterations had `acks=0` and the old keys were still intact.
-- `--iterations 4 --seed 7 --mode compaction` -> pass, including kills while compact commands were in the stream. This does not prove the kill landed inside `os.replace`.
-- `--iterations 4 --seed 42 --mode recovery-crash` -> pass. After that, the mode was changed to kill `open` four times per iteration, including an immediate kill. A fresh `--iterations 3 --seed 42 --mode recovery-crash` also passed.
-- `--iterations 1 --seed 3 --mode large-values` -> 12 acknowledged 1 MB puts survived; the 13th was in flight and absent (`without-inflight`).
-- `--iterations 1 --seed 11 --mode large-batches` -> two acknowledged batches of 10,000 puts survived; the third batch was in flight and absent.
+Version 2 (one `TXN1` block, one `os.fsync`), 6 Nov 2026:
 
-The hand-chop unit tests still exist. They are a different test from process kill.
+- `python torture/torture.py --iterations 500 --seed 12345` -> `PASS 500 FAIL 0` in 221 seconds. Kill is `TerminateProcess`. Two writer threads. The oracle records a line only when it reads `ACK`. Most iterations were `with-inflight`. A shorter 200-iteration run on the same format also passed, in 69 seconds.
+- `python torture/bench_recover.py --keys 1000000` -> `recovery_ms=1748.2` and, on a second run, `recovery_ms=1743.7`. File 16.0 MB. Sample keys matched.
+- `tests/test_replace_kill.py` -> both kills passed: pause before `os.replace`, and pause after it.
+
+Earlier format (a separate frame per operation, two fsyncs). These numbers do not apply to the current files:
+
+- `--iterations 500 --seed 12345` -> `PASS 500 FAIL 0` in 269 seconds.
+- `--iterations 4 --seed 999 --mode disk-full` -> pass. Later iterations had `acks=0` and the old keys stayed.
+- `--iterations 4 --seed 7 --mode compaction` -> pass. That did not aim the kill at `os.replace`.
+- `--iterations 3 --seed 42 --mode recovery-crash` -> pass after the mode was strengthened to four `open` kills per iteration.
+- `--iterations 1 --seed 3 --mode large-values` -> 12 acknowledged 1 MB puts survived; the 13th was absent.
+- `--iterations 1 --seed 11 --mode large-batches` -> two acknowledged batches of 10,000 puts survived; the third was absent.
+
+A two-pass scan of the million-key file measured 2244.8 ms and was rejected because it misses the 2 second line. The current scanner records offsets, then updates the dictionary.
 
 ## 5. If we had 24 more hours
 
-1. Time `open` on 1,000,000 small keys, and compact first if the replay is slower than 2 seconds.
-2. A kill that is aimed at the `os.replace` line, not just at a serve process that sometimes happens to be compacting.
+1. Repeat the other torture modes (large values, large batches, disk full, recovery crash, compaction) on this file format. The default 500-kill run and the replace-pause tests are the current evidence.
+2. A kill inside the `os.replace` syscall, rather than on the pause before it and the pause after it.
 3. Move the demo copy off OneDrive onto a normal local disk.

@@ -64,7 +64,7 @@ The first line from serve is `READY <keys> <recovery_ms>`.
 
 ## What is durable
 
-`put`, `del`, and `batch` return only after `os.fsync` of the commit marker. A batch is visible only when that marker is valid. See `ARCHITECTURE.md` for the byte layout and the recovery steps.
+`put`, `del`, and `batch` return only after `os.fsync` of one `TXN1` block. That block holds every operation in the batch and one checksum of the whole body. Recovery keeps the batch only when the checksum matches. See `ARCHITECTURE.md` for the byte layout.
 
 ## Limits
 
@@ -86,12 +86,12 @@ python torture\torture.py --iterations 100 --seed 42 --mode disk-full
 python torture\torture.py --iterations 100 --seed 7 --mode large-batches
 ```
 
-`--seed` is required. On 6 Nov 2026, `--iterations 500 --seed 12345` finished `PASS 500 FAIL 0` in 269 seconds on this laptop. Some iterations matched `with-inflight`: the commit was already on disk before the tool read `ACK`. That is scenario A4, and it is legal.
+`--seed` is required. On this version-2 file, `--iterations 500 --seed 12345` finished `PASS 500 FAIL 0` in 221 seconds on 6 Nov 2026. Some iterations matched `with-inflight`: the block was already on disk before the tool read `ACK`. That is scenario A4, and it is legal. An earlier file format also passed 500 kills, in 269 seconds. Quote the 221 second run for this code.
 
 The database file for a torture run is created under the system temp folder, not under OneDrive.
 
 ## What is not proven yet
 
-Unit tests cover put/get/delete, batch order, a torn tail, a one-byte chop, disk-full refusal, two threads, and compaction shrink. The 500-kill run above is real. It is a process kill, not a power cut. One million keys have not been timed. A kill has not been aimed at the single `os.replace` line inside compaction.
+Unit tests cover put/get/delete, batch order, a torn tail, a one-byte chop, disk-full refusal, two threads, and compaction shrink. The 500-kill run above is a process kill, not a power cut. Opening 1,000,000 keys measured 1748.2 ms and 1743.7 ms (`python torture/bench_recover.py --keys 1000000`, file 16.0 MB). `tests/test_replace_kill.py` kills the process on the pause immediately before `os.replace` and on the pause immediately after it. The kill is not inside the kernel call itself.
 
 The project folder is under OneDrive. OneDrive can lock files and delay disk writes. For the demo, copy the repository to a normal local folder such as `C:\kvdemo` if kills start behaving strangely.
