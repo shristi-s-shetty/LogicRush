@@ -527,13 +527,16 @@ class Database:
             raise KvError("database is not open")
 
     def _acquire_file_lock(self, path: str) -> None:
-        import msvcrt
-
         lock_path = path + ".lock"
         handle = open(lock_path, "a+b")
         handle.seek(0)
         try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            try:
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except ImportError:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             handle.close()
             raise KvError("database is locked by another process") from exc
@@ -544,11 +547,14 @@ class Database:
             self._file.close()
             self._file = None
         if self._lock_file is not None:
-            import msvcrt
-
             try:
                 self._lock_file.seek(0)
-                msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                try:
+                    import msvcrt
+                    msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except ImportError:
+                    import fcntl
+                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
             except OSError:
                 pass
             self._lock_file.close()
