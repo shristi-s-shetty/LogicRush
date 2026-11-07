@@ -49,3 +49,4 @@ class FileLock:
                 pass
             self._handle.close()
             self._handle = None
+
