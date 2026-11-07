@@ -63,6 +63,27 @@ def _pause_for_crash(point: str) -> None:
     time.sleep(30)
 
 
+def _atomic_replace(src: str, dst: str, max_retries: int = 25, backoff: float = 0.05) -> None:
+    """Atomically replace dst with src, handling transient Windows file locks.
+
+    On Windows (especially in directories monitored by OneDrive, Windows Search,
+    or real-time antivirus scanners), a newly closed file handle may be momentarily
+    inspected with shared-read locks by background system services. Retrying over
+    a brief window (up to ~1.2s) allows background inspection to release while
+    preserving atomic filesystem swap semantics.
+    """
+    import gc
+    gc.collect()
+    for attempt in range(max_retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(backoff)
+
+
 def _as_bytes(data, what: str, min_len: int, max_len: int) -> bytes:
     if isinstance(data, str):
         data = data.encode("utf-8")
@@ -484,7 +505,7 @@ class Database:
             # unless KVDB_CRASH_AT is set.
             _pause_for_crash("before-replace")
             try:
-                os.replace(tmp, self._path)
+                _atomic_replace(tmp, self._path)
             except Exception:
                 self._file = open(self._path, "r+b")
                 self._file.seek(0, os.SEEK_END)
