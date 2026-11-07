@@ -17,12 +17,21 @@ only after fsync of the commit marker.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import kvdb
+
+DEFAULT_DB = "data.kv"
+
+
+def _resolve_path_and_key(path_arg: str, key_arg: str | None) -> tuple[str, str]:
+    if key_arg is not None:
+        return path_arg, key_arg
+    return DEFAULT_DB, path_arg
 
 
 def _open(path: str, max_bytes):
@@ -37,7 +46,8 @@ def _print_error(message: str) -> int:
 
 
 def cmd_open(args) -> int:
-    db = _open(args.path, args.max_bytes)
+    path = args.path or DEFAULT_DB
+    db = _open(path, args.max_bytes)
     try:
         print(f"keys={db.key_count} recovery_ms={db.recovery_ms:.3f}")
     finally:
@@ -46,18 +56,28 @@ def cmd_open(args) -> int:
 
 
 def cmd_put(args) -> int:
-    db = _open(args.path, args.max_bytes)
+    # If 2 args were provided (e.g. `put name Alice`), args.value is empty
+    if not args.value and not (args.path.endswith((".kv", ".db", ".log")) or os.path.isfile(args.path)):
+        path = DEFAULT_DB
+        key = args.path
+        val = args.key
+    else:
+        path = args.path
+        key = args.key
+        val = " ".join(args.value)
+    db = _open(path, args.max_bytes)
     try:
-        db.put(args.key, " ".join(args.value))
+        db.put(key, val)
     finally:
         db.close()
     return 0
 
 
 def cmd_get(args) -> int:
-    db = _open(args.path, args.max_bytes)
+    path, key = _resolve_path_and_key(args.path, args.key)
+    db = _open(path, args.max_bytes)
     try:
-        value = db.get(args.key)
+        value = db.get(key)
     finally:
         db.close()
     if value is None:
@@ -68,9 +88,10 @@ def cmd_get(args) -> int:
 
 
 def cmd_del(args) -> int:
-    db = _open(args.path, args.max_bytes)
+    path, key = _resolve_path_and_key(args.path, args.key)
+    db = _open(path, args.max_bytes)
     try:
-        db.delete(args.key)
+        db.delete(key)
     finally:
         db.close()
     return 0
@@ -221,7 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     open_p = sub.add_parser("open")
-    open_p.add_argument("path")
+    open_p.add_argument("path", nargs="?", default=DEFAULT_DB)
     _add_max_bytes(open_p)
     open_p.set_defaults(func=cmd_open)
 
@@ -234,13 +255,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     get_p = sub.add_parser("get")
     get_p.add_argument("path")
-    get_p.add_argument("key")
+    get_p.add_argument("key", nargs="?", default=None)
     _add_max_bytes(get_p)
     get_p.set_defaults(func=cmd_get)
 
     del_p = sub.add_parser("del")
     del_p.add_argument("path")
-    del_p.add_argument("key")
+    del_p.add_argument("key", nargs="?", default=None)
     _add_max_bytes(del_p)
     del_p.set_defaults(func=cmd_del)
 
@@ -251,12 +272,12 @@ def build_parser() -> argparse.ArgumentParser:
     batch_p.set_defaults(func=cmd_batch)
 
     dump_p = sub.add_parser("dump")
-    dump_p.add_argument("path")
+    dump_p.add_argument("path", nargs="?", default=DEFAULT_DB)
     _add_max_bytes(dump_p)
     dump_p.set_defaults(func=cmd_dump)
 
     check_p = sub.add_parser("check")
-    check_p.add_argument("path")
+    check_p.add_argument("path", nargs="?", default=DEFAULT_DB)
     _add_max_bytes(check_p)
     check_p.set_defaults(func=cmd_check)
 
