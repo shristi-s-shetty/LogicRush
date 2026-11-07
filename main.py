@@ -104,6 +104,11 @@ def run_interactive_demo() -> int:
 
 
 def main() -> int:
+    # If called with step or walkthrough flag, run interactive step-by-step
+    if len(sys.argv) == 2 and sys.argv[1] in ("--step", "step", "--walkthrough", "walkthrough"):
+        import walkthrough
+        return walkthrough.run_walkthrough()
+
     # If called with no arguments or --demo, run interactive demo & help
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ("--demo", "demo")):
         return run_interactive_demo()
